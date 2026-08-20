@@ -2,6 +2,23 @@
 
 Extracted from UEFN 42.00 through `UToolsetRegistry` and Unreal reflection.
 
+## Reproducing the dump
+
+Run `dump_native_toolsets.py` from UEFN's Python console. The script first
+loads the known Epic toolset modules for 42.00, then enumerates every production
+`UToolsetDefinition` subclass visible to Unreal reflection.
+
+The output is written under `FortniteGame/Saved/ToolsetDumps`:
+
+- `registered-toolsets.json` contains the live registry schemas.
+- `native-toolset-schemas.json` contains every discovered native class,
+  including unregistered classes and classes without a valid schema.
+- `module-load-report.json` records every attempted module load and any class
+  that became visible after loading.
+
+Rows without a schema are retained with `schemaAvailable: false`; load and
+schema failures are reported instead of being silently omitted.
+
 ## Runtime registry
 
 - Registered toolsets: 12
