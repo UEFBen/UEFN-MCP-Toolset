@@ -15,9 +15,14 @@ The output is written under `FortniteGame/Saved/ToolsetDumps`:
   including unregistered classes and classes without a valid schema.
 - `module-load-report.json` records every attempted module load and any class
   that became visible after loading.
+- `agent-ready-tools.json` maps every native tool to its MCP name, normalized
+  agent route, argument template, full schemas, and `tools/call` request.
+- `AGENT_READY.md` is the human-readable route and command index.
 
 Rows without a schema are retained with `schemaAvailable: false`; load and
 schema failures are reported instead of being silently omitted.
+
+See the [agent-ready MCP command index](AGENT_READY.md) for direct tool routes.
 
 ## Runtime registry
 

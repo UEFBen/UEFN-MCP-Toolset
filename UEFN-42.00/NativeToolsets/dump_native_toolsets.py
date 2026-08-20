@@ -4,7 +4,7 @@ Run this file inside UEFN's Python environment, for example:
 
     py "C:/path/to/dump_native_toolsets.py"
 
-The JSON files are written to ``FortniteGame/Saved/ToolsetDumps``.
+The generated files are written to ``FortniteGame/Saved/ToolsetDumps``.
 Every discovered production ``UToolsetDefinition`` class is retained, including
 unregistered classes, classes without a schema, and classes that fail to load.
 """
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 import unreal
 
@@ -124,6 +125,225 @@ def _is_production_toolset(module_name: str, class_name: str) -> bool:
     return True
 
 
+def _schema_placeholder(schema: object) -> object:
+    if not isinstance(schema, dict):
+        return "<value>"
+    if "default" in schema:
+        return schema["default"]
+    if "const" in schema:
+        return schema["const"]
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        return enum_values[0]
+
+    choices = schema.get("oneOf") or schema.get("anyOf")
+    if isinstance(choices, list) and choices:
+        choice = next(
+            (
+                item
+                for item in choices
+                if isinstance(item, dict) and item.get("type") != "null"
+            ),
+            choices[0],
+        )
+        return _schema_placeholder(choice)
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next(
+            (item for item in schema_type if item != "null"),
+            schema_type[0] if schema_type else None,
+        )
+    if schema_type == "object" or "properties" in schema:
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return {}
+        return {
+            name: _schema_placeholder(properties.get(name, {}))
+            for name in required
+        }
+    if schema_type == "array":
+        items = schema.get("items")
+        return [_schema_placeholder(items)] if isinstance(items, dict) else []
+    if schema_type == "boolean":
+        return False
+    if schema_type == "integer":
+        return 0
+    if schema_type == "number":
+        return 0.0
+    if schema_type == "null":
+        return None
+    return "<string>" if schema_type == "string" else "<value>"
+
+
+def _argument_template(input_schema: object) -> dict[str, object]:
+    template = _schema_placeholder(input_schema)
+    return template if isinstance(template, dict) else {}
+
+
+def _agent_route(tool_name: str, server_alias: str = "uefn") -> str:
+    normalized_name = re.sub(r"[^0-9A-Za-z_]+", "_", tool_name).strip("_")
+    return f"mcp__{server_alias}__{normalized_name}"
+
+
+def _build_agent_ready_index(
+    registered_toolsets: list[dict[str, object]],
+    native_toolsets: list[dict[str, object]],
+) -> dict[str, object]:
+    registered_tools: dict[str, dict[str, object]] = {}
+    for toolset in registered_toolsets:
+        for tool in toolset.get("tools", []):
+            if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+                registered_tools[str(tool["name"])] = tool
+
+    records: dict[str, dict[str, object]] = {}
+    for class_entry in native_toolsets:
+        schema = class_entry.get("schema")
+        if not isinstance(schema, dict):
+            continue
+        for tool in schema.get("tools", []):
+            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str):
+                continue
+            tool_name = str(tool["name"])
+            class_registered = class_entry.get("registered") is True
+            available = tool_name in registered_tools
+            state = (
+                "registered"
+                if available
+                else "filtered"
+                if class_registered
+                else "unregistered"
+            )
+            records[tool_name] = {
+                "mcpToolName": tool_name,
+                "agentRoute": _agent_route(tool_name),
+                "toolset": tool_name.rsplit(".", 1)[0],
+                "classPath": class_entry.get("classPath"),
+                "classRegistered": class_registered,
+                "availableInRegistry": available,
+                "state": state,
+                "description": tool.get("description", ""),
+                "inputSchema": tool.get("inputSchema", {"type": "object"}),
+                "outputSchema": tool.get("outputSchema"),
+            }
+
+    # The live registry is authoritative for callable tools and their schemas.
+    for tool_name, tool in registered_tools.items():
+        record = records.setdefault(
+            tool_name,
+            {
+                "mcpToolName": tool_name,
+                "agentRoute": _agent_route(tool_name),
+                "toolset": tool_name.rsplit(".", 1)[0],
+                "classPath": None,
+                "classRegistered": True,
+            },
+        )
+        record.update(
+            {
+                "availableInRegistry": True,
+                "state": "registered",
+                "description": tool.get("description", ""),
+                "inputSchema": tool.get("inputSchema", {"type": "object"}),
+                "outputSchema": tool.get("outputSchema"),
+            }
+        )
+
+    tools = sorted(
+        records.values(),
+        key=lambda entry: str(entry["mcpToolName"]).casefold(),
+    )
+    for index, tool in enumerate(tools, start=1):
+        arguments = _argument_template(tool["inputSchema"])
+        tool["argumentsTemplate"] = arguments
+        tool["agentCall"] = {
+            "tool": tool["agentRoute"],
+            "arguments": arguments,
+        }
+        tool["mcpCall"] = {
+            "jsonrpc": "2.0",
+            "id": index,
+            "method": "tools/call",
+            "params": {
+                "name": tool["mcpToolName"],
+                "arguments": arguments,
+            },
+        }
+
+    return {
+        "serverAlias": "uefn",
+        "routeFormat": "mcp__<server-alias>__<tool-name-with-underscores>",
+        "counts": {
+            "tools": len(tools),
+            "registered": sum(1 for tool in tools if tool["state"] == "registered"),
+            "filtered": sum(1 for tool in tools if tool["state"] == "filtered"),
+            "unregistered": sum(1 for tool in tools if tool["state"] == "unregistered"),
+        },
+        "tools": tools,
+    }
+
+
+def _build_agent_ready_markdown(agent_index: dict[str, object]) -> str:
+    counts = agent_index["counts"]
+    lines = [
+        "# Agent-ready native UEFN tools — 42.00",
+        "",
+        "Generated from the native `UToolsetRegistry` schemas.",
+        "",
+        f"- Discovered tools: {counts['tools']}",
+        f"- Available in the live registry: {counts['registered']}",
+        f"- Filtered from registered class schemas: {counts['filtered']}",
+        f"- Declared by unregistered classes: {counts['unregistered']}",
+        "",
+        "Only `registered` entries are immediately callable. `filtered` and",
+        "`unregistered` entries document native schemas that are not currently",
+        "available through the live registry.",
+        "",
+        "## Calling a tool",
+        "",
+        "`mcpToolName` is the authoritative dotted name passed to MCP `tools/call`.",
+        "`agentRoute` is the normalized agent command. The `uefn` segment is the",
+        "server alias; replace it if the MCP server uses a different alias.",
+        "",
+        "```json",
+        "{",
+        '  "jsonrpc": "2.0",',
+        '  "id": 1,',
+        '  "method": "tools/call",',
+        '  "params": {',
+        '    "name": "EditorToolset.EditorAppToolset.GetActiveEditorModes",',
+        '    "arguments": {}',
+        "  }",
+        "}",
+        "```",
+        "",
+        "The machine-readable [`agent-ready-tools.json`](agent-ready-tools.json)",
+        "contains the full input/output schemas, agent-call templates, and complete",
+        "`tools/call` request for every discovered tool.",
+        "",
+        "## Tool routes",
+        "",
+        "| State | MCP tool name | Agent route | Arguments template |",
+        "|---|---|---|---|",
+    ]
+    for tool in agent_index["tools"]:
+        arguments = json.dumps(
+            tool["argumentsTemplate"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        lines.append(
+            "| `{}` | `{}` | `{}` | `{}` |".format(
+                tool["state"],
+                tool["mcpToolName"],
+                tool["agentRoute"],
+                arguments,
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
 def _inspect_toolset_class(
     registry: object,
     class_path: str,
@@ -206,6 +426,7 @@ def dump_native_toolsets() -> dict[str, object]:
     schema_errors = [
         entry for entry in native_toolsets if "schemaError" in entry
     ]
+    agent_index = _build_agent_ready_index(registered_toolsets, native_toolsets)
 
     saved_dir = unreal.Paths.convert_relative_path_to_full(
         unreal.Paths.project_saved_dir()
@@ -216,6 +437,11 @@ def dump_native_toolsets() -> dict[str, object]:
     _write_json(output_dir / "registered-toolsets.json", registered_toolsets)
     _write_json(output_dir / "native-toolset-schemas.json", native_toolsets)
     _write_json(output_dir / "module-load-report.json", module_report)
+    _write_json(output_dir / "agent-ready-tools.json", agent_index)
+    (output_dir / "AGENT_READY.md").write_text(
+        _build_agent_ready_markdown(agent_index),
+        encoding="utf-8",
+    )
 
     summary = {
         "engineVersion": unreal.SystemLibrary.get_engine_version(),
@@ -240,6 +466,10 @@ def dump_native_toolsets() -> dict[str, object]:
         "moduleLoadsSucceeded": module_report["loaded"],
         "moduleLoadsFailed": module_report["failed"],
         "classesAddedByModuleLoading": len(module_report["classesAdded"]),
+        "agentReadyTools": agent_index["counts"]["tools"],
+        "agentReadyRegistered": agent_index["counts"]["registered"],
+        "agentReadyFiltered": agent_index["counts"]["filtered"],
+        "agentReadyUnregistered": agent_index["counts"]["unregistered"],
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary
